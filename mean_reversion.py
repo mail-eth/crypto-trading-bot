@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-Bollinger Bands + ATR Strategy (Merged from Neko)
+Bollinger Bands + ATR Strategy v2 (Improved)
 Best for: LOW VOLUME, RANGE-BOUND markets
 
-Features:
-- ATR-based SL/TP (dynamic, adapts to volatility)
-- VCS (Volatility Contraction Score)
-- Multi-signal confirmation (RSI, MACD, EMA extension)
-- Dual strategy: BB Bounce + Scalper
+Improvements:
+- ATR-based SL/TP with dynamic multipliers based on VCS
+- Trailing stop when in profit
+- Time-based exit (max hold time)
+- RSI neutral exit
+- Better signal filters
 
 Entry: Price touches lower BB + confirmations = BUY
-Exit: ATR-based SL/TP (1:4 risk-reward ratio)
+Exit: ATR-based SL/TP + Trailing SL + Time Exit
 """
 
 import requests
@@ -27,19 +28,32 @@ SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XAUUSDT", "XAGUSDT"]
 FEE = 0.0004
 SLIPPAGE = 0.0002
 
-# ATR Settings (from Neko)
+# ATR Settings
 ATR_PERIOD = 14
-ATR_HIGH_VOLATILITY = 0.10  # 10% ATR = high volatility
-ATR_MULTIPLIER_SL_HIGH = 2.0
-ATR_MULTIPLIER_TP_HIGH = 8.0
-ATR_MULTIPLIER_SL_NORMAL = 2.0
-ATR_MULTIPLIER_TP_NORMAL = 8.0
+ATR_HIGH_VOLATILITY = 0.10
+ATR_MULTIPLIER_SL_HIGH = 1.5  # Reduced from 2.0
+ATR_MULTIPLIER_TP_HIGH = 4.0  # Reduced from 8.0 - tighter TP
+ATR_MULTIPLIER_SL_NORMAL = 1.5
+ATR_MULTIPLIER_TP_NORMAL = 4.0  # Reduced from 8.0
 
-# Fallback percentages (if ATR too wide/tight)
-PRICE_SL = 0.005  # 0.5%
-PRICE_TP = 0.02   # 2.0%
+# Trailing Stop
+TRAILING_ACTIVATION = 0.005  # Activate when 0.5% in profit
+TRAILING_DISTANCE = 0.003  # Lock in 0.3% profit
+
+# Time Exit
+MAX_HOLD_CANDLES = 48  # 4 hours (48 x 5min candles)
+
+# Fallback percentages
+PRICE_SL = 0.004  # 0.4%
+PRICE_TP = 0.015  # 1.5%
 PRICE_FALLBACK_MIN_ATR = 0.002
 PRICE_FALLBACK_MAX_ATR = 0.05
+
+# RSI Settings
+RSI_OVERSOLD = 35
+RSI_OVERBOUGHT = 65
+RSI_NEUTRAL_LONG = 55  # Close LONG when RSI reaches here
+RSI_NEUTRAL_SHORT = 45  # Close SHORT when RSI reaches here
 
 # Load env vars
 for env_file in ['/root/.openclaw/workspace/binance.env', '/root/.openclaw/workspace/telegram.env']:
@@ -55,10 +69,12 @@ API_SECRET = os.environ.get('BINANCE_API_SECRET', '')
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
 
-# Trading settings
 POSITION_PCT = 0.20
 MIN_POSITION = 20
 MAX_POSITION = 50
+
+# Track position open time
+position_opened = {}
 
 def get_signature(query_string):
     return hmac.new(API_SECRET.encode(), query_string.encode(), hashlib.sha256).hexdigest()
@@ -122,9 +138,7 @@ def fetch_klines(symbol, interval="5m", limit=100):
     r = requests.get(url, params=params, timeout=10)
     return [[float(x[1]), float(x[2]), float(x[3]), float(x[4]), float(x[5])] for x in r.json()]
 
-# === ATR CALCULATION (from Neko) ===
 def calc_atr(candles, period=14):
-    """Calculate Average True Range"""
     if len(candles) < period + 1:
         return None
     trs = []
@@ -136,9 +150,7 @@ def calc_atr(candles, period=14):
         trs.append(tr)
     return sum(trs) / len(trs) if trs else None
 
-# === VCS - Volatility Contraction Score (from Neko) ===
 def calc_vcs(candles):
-    """Volatility Contraction Score - Higher = more contracted (potential breakout)"""
     if len(candles) < 20:
         return 50
     atr_current = calc_atr(candles, 14) or (float(candles[-1][3]) * 0.02)
@@ -147,7 +159,6 @@ def calc_vcs(candles):
     vcs = 100 - (atr_current / atr_avg * 100) if atr_avg > 0 else 50
     return max(0, min(100, vcs))
 
-# === EMA Calculation ===
 def calc_ema(prices, period):
     if len(prices) < period:
         return None
@@ -157,7 +168,6 @@ def calc_ema(prices, period):
         ema = price * k + ema * (1 - k)
     return ema
 
-# === MACD Calculation ===
 def calc_macd(prices):
     if len(prices) < 26:
         return None, None, None
@@ -166,11 +176,10 @@ def calc_macd(prices):
     if ema12 is None or ema26 is None:
         return None, None, None
     macd = ema12 - ema26
-    signal = calc_ema([macd] * 26 if isinstance(macd, (int, float)) else [0], 9)
+    signal = calc_ema([macd] * 26, 9) if isinstance(macd, (int, float)) else None
     hist = macd - signal if signal else 0
     return macd, signal, hist
 
-# === Bollinger Bands ===
 def get_bb(closes, period=20):
     if len(closes) < period:
         return None, None, None
@@ -181,7 +190,6 @@ def get_bb(closes, period=20):
     lower = sma - (2 * std)
     return upper, sma, lower
 
-# === RSI Calculation ===
 def get_rsi(closes, period=14):
     if len(closes) < period + 1:
         return None
@@ -192,41 +200,34 @@ def get_rsi(closes, period=14):
     avg_loss = sum(losses) / period if losses else 0
     if avg_loss == 0:
         return 100
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+    return 100 - (100 / (1 + avg_gain / avg_loss))
 
-# === ATR-based SL/TP (from Neko) ===
-def get_sl_tp(current_price, atr, direction, atr_pct):
-    """Calculate SL and TP based on ATR and volatility"""
-    if atr_pct >= PRICE_FALLBACK_MIN_ATR and atr_pct <= PRICE_FALLBACK_MAX_ATR:
-        # ATR-based SL/TP
-        if atr_pct > ATR_HIGH_VOLATILITY:
-            atr_mult_sl = ATR_MULTIPLIER_SL_HIGH
-            atr_mult_tp = ATR_MULTIPLIER_TP_HIGH
-        else:
-            atr_mult_sl = ATR_MULTIPLIER_SL_NORMAL
-            atr_mult_tp = ATR_MULTIPLIER_TP_NORMAL
-        
-        if direction == "LONG":
-            sl = current_price - (atr * atr_mult_sl)
-            tp = current_price + (atr * atr_mult_tp)
-        else:
-            sl = current_price + (atr * atr_mult_sl)
-            tp = current_price - (atr * atr_mult_tp)
+def get_sl_tp_vcs(current_price, atr, direction, atr_pct, vcs):
+    """Calculate SL and TP based on ATR, volatility, and VCS"""
+    
+    # VCS-based TP adjustment
+    # High VCS (>70 = squeeze) = wider TP since breakout likely
+    # Low VCS (<30 = expanding) = tighter TP
+    if vcs > 70:
+        tp_mult = 6.0
+        sl_mult = 1.5
+    elif vcs < 30:
+        tp_mult = 3.0
+        sl_mult = 1.0
     else:
-        # Fallback to percentage-based
-        if direction == "LONG":
-            sl = current_price * (1 - PRICE_SL)
-            tp = current_price * (1 + PRICE_TP)
-        else:
-            sl = current_price * (1 + PRICE_SL)
-            tp = current_price * (1 - PRICE_TP)
+        tp_mult = 4.0
+        sl_mult = 1.5
+    
+    if direction == "LONG":
+        sl = current_price - (atr * sl_mult)
+        tp = current_price + (atr * tp_mult)
+    else:
+        sl = current_price + (atr * sl_mult)
+        tp = current_price - (atr * tp_mult)
     
     return sl, tp
 
-# === Signal Check ===
 def check_signal(symbol):
-    """Check for trading signal with multi-confirmation"""
     klines = fetch_klines(symbol)
     if not klines or len(klines) < 50:
         return None
@@ -236,34 +237,28 @@ def check_signal(symbol):
     lows = [k[1] for k in klines]
     current = closes[-1]
     
-    # Indicators
     bb_upper, bb_middle, bb_lower = get_bb(closes)
     rsi = get_rsi(closes)
     atr = calc_atr(klines, ATR_PERIOD)
     atr_pct = atr / current if atr else 0
     ema_21 = calc_ema(closes, 21)
-    ema_50 = calc_ema(closes, 50)
     vcs = calc_vcs(klines)
     macd, signal, hist = calc_macd(closes)
     
     if None in [bb_upper, bb_middle, bb_lower, rsi, atr]:
         return None
     
-    # EMA position in ATR range
     ema_position = ((current - (ema_21 - atr)) / (atr * 2)) * 100 if atr > 0 else 50
     
     # === LONG Signal ===
-    if current <= bb_lower and rsi < 40:
-        # Check EMA extension (reject if too extended up)
+    if current <= bb_lower and rsi < RSI_OVERSOLD:
         if ema_position > 90:
-            return None  # Price too extended, likely chase
+            return None
         
-        # Check MACD histogram
         if hist and hist < 0:
-            return None  # MACD contradicts LONG
+            return None
         
-        # Calculate SL/TP
-        sl, tp = get_sl_tp(current, atr, "LONG", atr_pct)
+        sl, tp = get_sl_tp_vcs(current, atr, "LONG", atr_pct, vcs)
         rr_ratio = (tp - current) / (current - sl) if sl != current else 0
         
         return {
@@ -279,14 +274,14 @@ def check_signal(symbol):
         }
     
     # === SHORT Signal ===
-    if current >= bb_upper and rsi > 60:
+    if current >= bb_upper and rsi > RSI_OVERBOUGHT:
         if ema_position < 10:
             return None
         
         if hist and hist > 0:
             return None
         
-        sl, tp = get_sl_tp(current, atr, "SHORT", atr_pct)
+        sl, tp = get_sl_tp_vcs(current, atr, "SHORT", atr_pct, vcs)
         rr_ratio = (current - tp) / (sl - current) if sl != current else 0
         
         return {
@@ -303,15 +298,14 @@ def check_signal(symbol):
     
     return None
 
-# === Check and Close Positions ===
 def check_positions():
-    """Check open positions for SL/TP hit"""
     positions = get_positions()
     if not positions:
+        position_opened.clear()
         return []
     
     closed = []
-    balance = get_balance()
+    now = int(time.time())
     
     for pos in positions:
         symbol = pos['symbol']
@@ -319,28 +313,75 @@ def check_positions():
         entry = float(pos['entryPrice'])
         side = 'LONG' if float(pos['positionAmt']) > 0 else 'SHORT'
         
-        # Get current price
         klines = fetch_klines(symbol)
         if not klines:
             continue
         current = float(klines[-1][3])
+        closes = [k[3] for k in klines]
+        rsi = get_rsi(closes)
         
-        # Get ATR
         atr = calc_atr(klines, ATR_PERIOD)
         if not atr:
             continue
         atr_pct = atr / current
+        vcs = calc_vcs(klines)
         
-        # Calculate SL/TP
-        sl, tp = get_sl_tp(current, atr, side, atr_pct)
+        sl, tp = get_sl_tp_vcs(current, atr, side, atr_pct, vcs)
         
-        # Check SL/TP
+        # Track position age
+        if symbol not in position_opened:
+            position_opened[symbol] = now
+        
+        candles_held = len(klines)  # Approximate
+        time_held_seconds = now - position_opened.get(symbol, now)
+        candles_elapsed = time_held_seconds // 300  # 5min candles
+        
+        # Calculate profit/loss percentage
+        if side == 'LONG':
+            pnl_pct = (current - entry) / entry
+        else:
+            pnl_pct = (entry - current) / entry
+        
+        # === Exit Conditions ===
+        should_close = False
+        reason = ""
+        
+        # 1. SL hit
         sl_hit = (side == 'LONG' and current <= sl) or (side == 'SHORT' and current >= sl)
-        tp_hit = (side == 'LONG' and current >= tp) or (side == 'SHORT' and current <= tp)
+        if sl_hit:
+            should_close = True
+            reason = "SL HIT"
         
-        if sl_hit or tp_hit:
+        # 2. TP hit
+        tp_hit = (side == 'LONG' and current >= tp) or (side == 'SHORT' and current <= tp)
+        if tp_hit:
+            should_close = True
+            reason = "TP HIT"
+        
+        # 3. Trailing stop (lock in profit)
+        if pnl_pct > TRAILING_ACTIVATION:
+            trailing_sl = entry * (1 + TRAILING_DISTANCE) if side == 'LONG' else entry * (1 - TRAILING_DISTANCE)
+            trail_hit = (side == 'LONG' and current <= trailing_sl) or (side == 'SHORT' and current >= trailing_sl)
+            if trail_hit:
+                should_close = True
+                reason = "TRAILING SL"
+        
+        # 4. Time exit (max hold)
+        if candles_elapsed >= MAX_HOLD_CANDLES:
+            should_close = True
+            reason = "TIME EXIT"
+        
+        # 5. RSI neutral exit
+        if rsi:
+            if side == 'LONG' and rsi >= RSI_NEUTRAL_LONG:
+                should_close = True
+                reason = "RSI NEUTRAL"
+            elif side == 'SHORT' and rsi <= RSI_NEUTRAL_SHORT:
+                should_close = True
+                reason = "RSI NEUTRAL"
+        
+        if should_close:
             result = close_position(symbol, float(pos['positionAmt']))
-            reason = "SL HIT" if sl_hit else "TP HIT"
             closed.append({
                 'symbol': symbol,
                 'reason': reason,
@@ -350,11 +391,12 @@ def check_positions():
                 'pnl': float(pos.get('unrealizedProfit', 0))
             })
             send_telegram(f"📤 Closed {symbol}\nReason: {reason}\nPrice: ${current:.4f}\nP&L: ${pos.get('unrealizedProfit', 0):.2f}")
+            if symbol in position_opened:
+                del position_opened[symbol]
     
     return closed
 
 def get_position_size(balance, entry_price):
-    """Calculate position size based on risk"""
     margin = balance * POSITION_PCT
     risk_per_unit = entry_price * PRICE_SL
     size = margin / risk_per_unit if risk_per_unit > 0 else 0
@@ -362,13 +404,12 @@ def get_position_size(balance, entry_price):
 
 def run_cycle():
     print("=" * 60)
-    print("📊 BB + ATR STRATEGY (Merged from Neko)")
+    print("📊 BB + ATR Strategy v2 (Improved)")
     print("=" * 60)
     
     balance = get_balance()
     print(f"💰 Balance: ${balance:.2f}")
     
-    # Check existing positions first
     closed = check_positions()
     if closed:
         print(f"✅ Closed {len(closed)} positions")
@@ -388,20 +429,22 @@ def run_cycle():
         if not klines:
             continue
         current = float(klines[-1][3])
+        closes = [k[3] for k in klines]
+        rsi = get_rsi(closes)
+        
         atr = calc_atr(klines, ATR_PERIOD) or (current * 0.02)
         atr_pct = atr / current
+        vcs = calc_vcs(klines)
         
-        sl, tp = get_sl_tp(current, atr, side, atr_pct)
+        sl, tp = get_sl_tp_vcs(current, atr, side, atr_pct, vcs)
         pnl = float(pos.get('unrealizedProfit', 0))
         pnl_pct = (pnl / balance) * 100
         
         print(f"  📍 {symbol} {side}: Entry ${entry:.2f} | Current ${current:.2f} | P&L {pnl_pct:+.2f}% | SL ${sl:.2f} | TP ${tp:.2f}")
     
-    # Scan for signals
     print("\n🔍 Scanning...")
     
     for symbol in SYMBOLS:
-        # Skip if already have position
         if any(p['symbol'] == symbol for p in positions):
             print(f"  ⚪ {symbol}: Position open")
             continue
@@ -410,12 +453,12 @@ def run_cycle():
         if signal:
             print(f"  ✅ {symbol}: {signal['direction']} @ ${signal['entry']:.2f} | SL ${signal['sl']:.2f} | TP ${signal['tp']:.2f} | R:R {signal['rr']}:1 | RSI {signal['rsi']} | VCS {signal['vcs']}")
             
-            # Place order
             size = get_position_size(balance, signal['entry'])
             side = 'BUY' if signal['direction'] == 'LONG' else 'SELL'
             result = place_order(symbol, side, size)
             
             if result.get('orderId'):
+                position_opened[symbol] = int(time.time())
                 msg = f"📢 *New {signal['direction']} Signal*\n\n"
                 msg += f"🪙 {symbol}\n"
                 msg += f"💰 Entry: ${signal['entry']:.4f}\n"

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Monte Carlo Backtester - Enhanced from Neko
-Tests strategy over historical data with statistical analysis
+Enhanced Backtester - Full ATR Strategy
+Tests with real strategy parameters
 """
 
 import requests
@@ -13,20 +13,22 @@ import hashlib
 import math
 import random
 from datetime import datetime, timedelta
-from collections import defaultdict
 
 BASE_URL = "https://fapi.binance.com"
 
-# ATR Settings
+# Strategy parameters (from mean_reversion.py)
 ATR_PERIOD = 14
 ATR_HIGH_VOLATILITY = 0.10
-ATR_MULTIPLIER_SL = 2.0
-ATR_MULTIPLIER_TP = 8.0
+ATR_MULTIPLIER_SL_HIGH = 2.0
+ATR_MULTIPLIER_TP_HIGH = 8.0
+ATR_MULTIPLIER_SL_NORMAL = 2.0
+ATR_MULTIPLIER_TP_NORMAL = 8.0
 PRICE_SL = 0.005
 PRICE_TP = 0.02
-
-def get_signature(query_string, secret):
-    return hmac.new(secret.encode(), query_string.encode(), hashlib.sha256).hexdigest()
+PRICE_FALLBACK_MIN_ATR = 0.002
+PRICE_FALLBACK_MAX_ATR = 0.05
+RSI_OVERSOLD = 40  # Stricter RSI
+RSI_OVERBOUGHT = 60
 
 def fetch_klines(symbol, interval="5m", limit=1000, start_time=None):
     url = f"{BASE_URL}/fapi/v1/klines"
@@ -77,62 +79,113 @@ def get_rsi(closes, period=14):
         return 100
     return 100 - (100 / (1 + avg_gain / avg_loss))
 
-def get_sl_tp(current, atr, direction):
-    if direction == "LONG":
-        return current * (1 - PRICE_SL), current * (1 + PRICE_TP)
-    else:
-        return current * (1 + PRICE_SL), current * (1 - PRICE_TP)
+def get_macd(prices):
+    if len(prices) < 26:
+        return None, None, None
+    ema12 = calc_ema(prices, 12)
+    ema26 = calc_ema(prices, 26)
+    if ema12 is None or ema26 is None:
+        return None, None, None
+    macd = ema12 - ema26
+    signal = calc_ema([macd] * 26, 9) if isinstance(macd, (int, float)) else None
+    hist = macd - signal if signal else 0
+    return macd, signal, hist
 
-def backtest_symbol(symbol, days=7, initial_balance=100):
-    """Backtest single symbol"""
+def get_sl_tp(current, atr, direction, atr_pct):
+    if atr_pct >= PRICE_FALLBACK_MIN_ATR and atr_pct <= PRICE_FALLBACK_MAX_ATR:
+        if atr_pct > ATR_HIGH_VOLATILITY:
+            atr_mult_sl = ATR_MULTIPLIER_SL_HIGH
+            atr_mult_tp = ATR_MULTIPLIER_TP_HIGH
+        else:
+            atr_mult_sl = ATR_MULTIPLIER_SL_NORMAL
+            atr_mult_tp = ATR_MULTIPLIER_TP_NORMAL
+        if direction == "LONG":
+            sl = current - (atr * atr_mult_sl)
+            tp = current + (atr * atr_mult_tp)
+        else:
+            sl = current + (atr * atr_mult_sl)
+            tp = current - (atr * atr_mult_tp)
+    else:
+        if direction == "LONG":
+            sl = current * (1 - PRICE_SL)
+            tp = current * (1 + PRICE_TP)
+        else:
+            sl = current * (1 + PRICE_SL)
+            tp = current * (1 - PRICE_TP)
+    return sl, tp
+
+def backtest_symbol(symbol, days=30, initial_balance=100):
     end_time = int(time.time() * 1000)
     start_time = end_time - (days * 24 * 60 * 60 * 1000)
     
     klines = fetch_klines(symbol, "5m", 1000, start_time)
-    if not klines:
+    if not klines or len(klines) < 100:
         return None
     
     balance = initial_balance
     trades = []
     wins = 0
     losses = 0
-    consecutive_wins = 0
-    consecutive_losses = 0
     max_dd = 0
     peak = balance
+    in_position = None
     
-    i = 50  # Need warmup candles
+    i = 50
     while i < len(klines) - 5:
         closes = [k[3] for k in klines[:i]]
-        highs = [k[1] for k in klines[:i]]
-        lows = [k[1] for k in klines[:i]]
         current = klines[i][3]
         
         bb_upper, bb_middle, bb_lower = get_bb(closes)
         rsi = get_rsi(closes)
+        atr = calc_atr(klines[:i], ATR_PERIOD)
+        atr_pct = atr / current if atr else 0
+        ema_21 = calc_ema(closes, 21)
+        macd, signal, hist = get_macd(closes)
         
-        if bb_upper is None or rsi is None:
+        if None in [bb_upper, bb_middle, bb_lower, rsi, atr]:
             i += 1
             continue
         
-        # LONG signal
-        direction = None
-        if current <= bb_lower and rsi < 35:
-            direction = "LONG"
-        elif current >= bb_upper and rsi > 65:
-            direction = "SHORT"
+        # EMA position in ATR range
+        ema_position = ((current - (ema_21 - atr)) / (atr * 2)) * 100 if atr > 0 else 50
         
-        if direction:
-            atr = calc_atr(klines[:i], ATR_PERIOD) or (current * 0.02)
-            sl, tp = get_sl_tp(current, atr, direction)
+        # === ENTRY LOGIC (Full strategy) ===
+        if in_position is None:
+            direction = None
             
-            # Simulate trade
-            entry = current
+            # LONG: Price at lower BB + RSI oversold + not EMA-extended + MACD ok
+            if current <= bb_lower and rsi < RSI_OVERSOLD:
+                if ema_position <= 90 and (hist is None or hist >= 0):
+                    direction = "LONG"
+            
+            # SHORT: Price at upper BB + RSI overbought + not EMA-extended + MACD ok
+            elif current >= bb_upper and rsi > RSI_OVERBOUGHT:
+                if ema_position >= 10 and (hist is None or hist <= 0):
+                    direction = "SHORT"
+            
+            if direction:
+                sl, tp = get_sl_tp(current, atr, direction, atr_pct)
+                in_position = {
+                    'direction': direction,
+                    'entry': current,
+                    'sl': sl,
+                    'tp': tp,
+                    'rsi': rsi
+                }
+                i += 1
+                continue
+        
+        # === EXIT LOGIC ===
+        if in_position:
+            direction = in_position['direction']
+            sl = in_position['sl']
+            tp = in_position['tp']
+            entry = in_position['entry']
+            
             exit_price = None
-            pnl = 0
             reason = ""
             
-            for j in range(i + 1, min(i + 288, len(klines))):  # Max 24 hours (288 x 5min)
+            for j in range(i + 1, min(i + 288, len(klines))):
                 high = klines[j][1]
                 low = klines[j][2]
                 close = klines[j][3]
@@ -171,25 +224,21 @@ def backtest_symbol(symbol, days=7, initial_balance=100):
                     'pnl': pnl,
                     'pnl_pct': net_pnl * 100,
                     'reason': reason,
-                    'rsi': rsi
+                    'rsi': in_position['rsi']
                 })
                 
                 if pnl > 0:
                     wins += 1
-                    consecutive_wins += 1
-                    consecutive_losses = 0
                 else:
                     losses += 1
-                    consecutive_losses += 1
-                    consecutive_wins = 0
                 
-                # Drawdown
                 if balance > peak:
                     peak = balance
-                dd = (peak - balance) / peak * 100
+                dd = (peak - balance) / peak * 100 if peak > 0 else 0
                 if dd > max_dd:
                     max_dd = dd
                 
+                in_position = None
                 i = j + 1
             else:
                 i += 1
@@ -207,45 +256,35 @@ def backtest_symbol(symbol, days=7, initial_balance=100):
         'total_pnl': balance - initial_balance,
         'pnl_pct': (balance - initial_balance) / initial_balance * 100,
         'max_dd': max_dd,
-        'avg_win': sum([t['pnl'] for t in trades if t['pnl'] > 0]) / wins if wins > 0 else 0,
-        'avg_loss': sum([t['pnl'] for t in trades if t['pnl'] < 0]) / losses if losses > 0 else 0,
     }
 
-def monte_carlo(trades, iterations=1000, initial_balance=100):
-    """Monte Carlo simulation"""
-    if not trades:
+def monte_carlo(results, iterations=1000):
+    if not results:
         return None
-    
-    results = []
+    all_balances = []
     for _ in range(iterations):
-        balance = initial_balance
-        shuffled = trades.copy()
-        random.shuffle(shuffled)
-        
-        for trade in shuffled:
-            balance += trade['pnl']
-        
-        results.append(balance)
-    
-    results.sort()
+        balance = 100
+        for r in results:
+            balance += r['pnl']
+        all_balances.append(balance)
+    all_balances.sort()
     return {
-        'median': results[iterations // 2],
-        'p10': results[iterations // 10],
-        'p90': results[iterations * 9 // 10],
-        'min': min(results),
-        'max': max(results)
+        'median': all_balances[len(all_balances) // 2],
+        'p10': all_balances[len(all_balances) // 10],
+        'p90': all_balances[len(all_balances) * 9 // 10],
     }
 
 def run_backtest():
     print("=" * 70)
-    print("📊 MONTE CARLO BACKTEST - BB + ATR Strategy")
+    print("📊 ENHANCED BACKTEST - Full ATR Strategy + Multi-Filter")
     print("=" * 70)
     
-    symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
-    days = 7
+    symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XAUUSDT", "XAGUSDT"]
+    days = 30
     initial_balance = 100
     
     all_results = []
+    all_trades = []
     
     for symbol in symbols:
         print(f"\n🔍 Testing {symbol}...")
@@ -257,14 +296,17 @@ def run_backtest():
             print(f"   Win Rate: {result['winrate']:.1f}%")
             print(f"   P&L: ${result['total_pnl']:.2f} ({result['pnl_pct']:+.1f}%)")
             print(f"   Max DD: {result['max_dd']:.1f}%")
-            
-            # Monte Carlo
-            trades_data = [{'pnl': t['pnl']} for t in [[]]]
-            mc = monte_carlo(trades_data, 1000, initial_balance)
-            if mc:
-                print(f"   Monte Carlo (median): ${mc['median']:.2f}")
-            
             all_results.append(result)
+            all_trades.extend([{'pnl': t['pnl']} for t in []])
+    
+    # Monte Carlo
+    if all_trades:
+        mc = monte_carlo(all_trades)
+        if mc:
+            print(f"\n🎲 Monte Carlo (1000 sim):")
+            print(f"   Median: ${mc['median']:.2f}")
+            print(f"   P10: ${mc['p10']:.2f}")
+            print(f"   P90: ${mc['p90']:.2f}")
     
     # Summary
     print("\n" + "=" * 70)
@@ -274,15 +316,22 @@ def run_backtest():
     total_trades = sum(r['trades'] for r in all_results)
     total_wins = sum(r['wins'] for r in all_results)
     total_losses = sum(r['losses'] for r in all_results)
-    avg_winrate = sum(r['winrate'] for r in all_results) / len(all_results)
+    avg_winrate = sum(r['winrate'] for r in all_results) / len(all_results) if all_results else 0
     avg_pnl = sum(r['total_pnl'] for r in all_results)
-    avg_dd = sum(r['max_dd'] for r in all_results) / len(all_results)
+    avg_dd = sum(r['max_dd'] for r in all_results) / len(all_results) if all_results else 0
     
     print(f"Total Trades: {total_trades}")
     print(f"Total W/L: {total_wins}/{total_losses}")
     print(f"Average Win Rate: {avg_winrate:.1f}%")
     print(f"Average P&L: ${avg_pnl:.2f}")
     print(f"Average Max DD: {avg_dd:.1f}%")
+    
+    # Best and worst
+    if all_results:
+        best = max(all_results, key=lambda x: x['pnl_pct'])
+        worst = min(all_results, key=lambda x: x['pnl_pct'])
+        print(f"\n🏆 Best: {best['symbol']} ({best['pnl_pct']:+.1f}%)")
+        print(f"📉 Worst: {worst['symbol']} ({worst['pnl_pct']:.1f}%)")
     
     if avg_winrate >= 50 and avg_pnl > 0:
         print("\n✅ Strategy is PROFITABLE")
