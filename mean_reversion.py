@@ -37,21 +37,21 @@ ATR_MULTIPLIER_SL_NORMAL = 1.5
 ATR_MULTIPLIER_TP_NORMAL = 4.0  # Reduced from 8.0
 
 # Trailing Stop
-TRAILING_ACTIVATION = 0.005  # Activate when 0.5% in profit
-TRAILING_DISTANCE = 0.003  # Lock in 0.3% profit
+TRAILING_ACTIVATION = 0.008  # Activate when 0.8% in profit
+TRAILING_DISTANCE = 0.004  # Lock in 0.4% profit
 
 # Time Exit
 MAX_HOLD_CANDLES = 48  # 4 hours (48 x 5min candles)
 
-# Fallback percentages
-PRICE_SL = 0.004  # 0.4%
-PRICE_TP = 0.015  # 1.5%
+# Fixed percentage TP/SL (bigger for $5/day target)
+PRICE_SL_PCT = 0.025  # 2.5% SL
+PRICE_TP_PCT = 0.05  # 5% TP
 PRICE_FALLBACK_MIN_ATR = 0.002
 PRICE_FALLBACK_MAX_ATR = 0.05
 
 # RSI Settings
-RSI_OVERSOLD = 35
-RSI_OVERBOUGHT = 65
+RSI_OVERSOLD = 40  # Lowered from 35 - be more aggressive
+RSI_OVERBOUGHT = 60  # Lowered from 65 - be more aggressive
 RSI_NEUTRAL_LONG = 55  # Close LONG when RSI reaches here
 RSI_NEUTRAL_SHORT = 45  # Close SHORT when RSI reaches here
 
@@ -69,9 +69,10 @@ API_SECRET = os.environ.get('BINANCE_API_SECRET', '')
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
 
-POSITION_PCT = 0.20
-MIN_POSITION = 20
-MAX_POSITION = 50
+POSITION_PCT = 0.80  # 80% of balance per trade
+MIN_POSITION = 40
+MAX_POSITION = 100
+MAX_POSITIONS = 2  # Max 2 positions at once
 
 # Track position open time
 position_opened = {}
@@ -115,6 +116,119 @@ def send_telegram(message):
         return r.json().get('ok', False)
     except:
         return False
+
+def get_tick_size(symbol):
+    """Get tick size for proper price rounding"""
+    try:
+        info_r = requests.get(f'{BASE_URL}/fapi/v1/exchangeInfo', timeout=10)
+        for s in info_r.json().get('symbols', []):
+            if s['symbol'] == symbol:
+                for f in s.get('filters', []):
+                    if f.get('filterType') == 'PRICE_FILTER':
+                        return float(f.get('tickSize', 0.00001))
+    except:
+        pass
+    return 0.00001
+
+def round_to_tick(price, tick_size):
+    """Round price to proper tick size"""
+    tick_str = f"{tick_size:.10f}".rstrip('0')
+    decimals = len(tick_str.split('.')[1]) if '.' in tick_str else 0
+    return float(f"{price:.{decimals}f}")
+
+def get_step_size(symbol):
+    """Get step size for proper quantity rounding"""
+    try:
+        info_r = requests.get(f'{BASE_URL}/fapi/v1/exchangeInfo', timeout=10)
+        for s in info_r.json().get('symbols', []):
+            if s['symbol'] == symbol:
+                for f in s.get('filters', []):
+                    if f.get('filterType') == 'LOT_SIZE':
+                        return float(f.get('stepSize', 0.001))
+    except:
+        pass
+    return 0.001
+
+def round_quantity(quantity, step_size):
+    """Round quantity to proper step size"""
+    step_str = f"{step_size:.10f}".rstrip('0')
+    decimals = len(step_str.split('.')[1]) if '.' in step_str else 0
+    return float(f"{quantity:.{decimals}f}")
+
+def place_order_with_algo_sl_tp(symbol, side, quantity, sl_price, tp_price):
+    """Place market order FIRST, then set SL/TP via algoOrder (Neko method)"""
+    headers = {'X-MBX-APIKEY': API_KEY}
+    
+    # Round quantity to proper step size
+    step_size = get_step_size(symbol)
+    quantity = round_quantity(quantity, step_size)
+    
+    # 1. Place MARKET order first
+    result = futures_request('POST', '/fapi/v1/order', {
+        'symbol': symbol,
+        'side': side,
+        'type': 'MARKET',
+        'quantity': str(quantity),
+    })
+    
+    order_id = result.get('orderId')
+    if not order_id or str(order_id) == 'N/A':
+        print(f"  ❌ Market order failed: {result}")
+        return result
+    
+    print(f"  ✅ Market order placed: {order_id}")
+    
+    # 2. Only place SL/TP if market order succeeded
+    tick_size = get_tick_size(symbol)
+    sl_trigger = round_to_tick(sl_price, tick_size)
+    tp_trigger = round_to_tick(tp_price, tick_size)
+    
+    # Determine sides
+    entry_side = side  # BUY for LONG, SELL for SHORT
+    sl_side = 'SELL' if side == 'BUY' else 'BUY'  # Opposite side for SL
+    tp_side = 'SELL' if side == 'BUY' else 'BUY'  # Opposite side for TP
+    
+    # 3. Place STOP LOSS via algoOrder
+    ts = int(time.time() * 1000)
+    sl_params = (
+        f"symbol={symbol}&side={sl_side}&type=STOP_MARKET&orderType=STOP_MARKET"
+        f"&algoType=CONDITIONAL&quantity={quantity}&reduceOnly=true"
+        f"&triggerPrice={sl_trigger}&stopPrice={sl_trigger}"
+        f"&workingType=CONTRACT_PRICE&timestamp={ts}"
+    )
+    sl_sig = get_signature(sl_params)
+    sl_url = f"{BASE_URL}/fapi/v1/algoOrder?{sl_params}&signature={sl_sig}"
+    
+    try:
+        sl_r = requests.post(sl_url, headers=headers, timeout=10)
+        if sl_r.status_code == 200:
+            print(f"  ✅ SL algo order placed: {sl_trigger}")
+        else:
+            print(f"  ⚠️ SL order warning: {sl_r.text[:100]}")
+    except Exception as e:
+        print(f"  ❌ SL order error: {e}")
+    
+    # 4. Place TAKE PROFIT via algoOrder
+    ts = int(time.time() * 1000)
+    tp_params = (
+        f"symbol={symbol}&side={tp_side}&type=TAKE_PROFIT_MARKET&orderType=TAKE_PROFIT_MARKET"
+        f"&algoType=CONDITIONAL&quantity={quantity}&reduceOnly=true"
+        f"&triggerPrice={tp_trigger}&stopPrice={tp_trigger}"
+        f"&workingType=CONTRACT_PRICE&timestamp={ts}"
+    )
+    tp_sig = get_signature(tp_params)
+    tp_url = f"{BASE_URL}/fapi/v1/algoOrder?{tp_params}&signature={tp_sig}"
+    
+    try:
+        tp_r = requests.post(tp_url, headers=headers, timeout=10)
+        if tp_r.status_code == 200:
+            print(f"  ✅ TP algo order placed: {tp_trigger}")
+        else:
+            print(f"  ⚠️ TP order warning: {tp_r.text[:100]}")
+    except Exception as e:
+        print(f"  ❌ TP order error: {e}")
+    
+    return result
 
 def place_order(symbol, side, quantity):
     return futures_request('POST', '/fapi/v1/order', {
@@ -203,27 +317,14 @@ def get_rsi(closes, period=14):
     return 100 - (100 / (1 + avg_gain / avg_loss))
 
 def get_sl_tp_vcs(current_price, atr, direction, atr_pct, vcs):
-    """Calculate SL and TP based on ATR, volatility, and VCS"""
-    
-    # VCS-based TP adjustment
-    # High VCS (>70 = squeeze) = wider TP since breakout likely
-    # Low VCS (<30 = expanding) = tighter TP
-    if vcs > 70:
-        tp_mult = 6.0
-        sl_mult = 1.5
-    elif vcs < 30:
-        tp_mult = 3.0
-        sl_mult = 1.0
-    else:
-        tp_mult = 4.0
-        sl_mult = 1.5
+    """Calculate SL and TP - Fixed 5% TP / 2.5% SL"""
     
     if direction == "LONG":
-        sl = current_price - (atr * sl_mult)
-        tp = current_price + (atr * tp_mult)
+        sl = current_price * 0.975  # 2.5% SL
+        tp = current_price * 1.05   # 5% TP
     else:
-        sl = current_price + (atr * sl_mult)
-        tp = current_price - (atr * tp_mult)
+        sl = current_price * 1.025   # 2.5% SL
+        tp = current_price * 0.95    # 5% TP
     
     return sl, tp
 
@@ -251,7 +352,9 @@ def check_signal(symbol):
     ema_position = ((current - (ema_21 - atr)) / (atr * 2)) * 100 if atr > 0 else 50
     
     # === LONG Signal ===
-    if current <= bb_lower and rsi < RSI_OVERSOLD:
+    # Aggressive: within 0.5% of BB lower (not exact touch)
+    at_bb_lower = current <= bb_lower * 1.005  # within 0.5%
+    if at_bb_lower and rsi < RSI_OVERSOLD:
         if ema_position > 90:
             return None
         
@@ -274,7 +377,9 @@ def check_signal(symbol):
         }
     
     # === SHORT Signal ===
-    if current >= bb_upper and rsi > RSI_OVERBOUGHT:
+    # Aggressive: within 0.5% of BB upper (not exact touch)
+    at_bb_upper = current >= bb_upper * 0.995  # within 0.5%
+    if at_bb_upper and rsi > RSI_OVERBOUGHT:
         if ema_position < 10:
             return None
         
@@ -390,7 +495,7 @@ def check_positions():
                 'exit': current,
                 'pnl': float(pos.get('unrealizedProfit', 0))
             })
-            send_telegram(f"📤 Closed {symbol}\nReason: {reason}\nPrice: ${current:.4f}\nP&L: ${pos.get('unrealizedProfit', 0):.2f}")
+            send_telegram(f"📤 Closed {symbol}\nReason: {reason}\nPrice: ${current:.4f}\nP&L: ${float(pos.get('unrealizedProfit', 0)):.2f}")
             if symbol in position_opened:
                 del position_opened[symbol]
     
@@ -398,7 +503,7 @@ def check_positions():
 
 def get_position_size(balance, entry_price):
     margin = balance * POSITION_PCT
-    risk_per_unit = entry_price * PRICE_SL
+    risk_per_unit = entry_price * PRICE_SL_PCT
     size = margin / risk_per_unit if risk_per_unit > 0 else 0
     return min(max(size, MIN_POSITION / entry_price), MAX_POSITION / entry_price)
 
@@ -445,6 +550,9 @@ def run_cycle():
     print("\n🔍 Scanning...")
     
     for symbol in SYMBOLS:
+        if len(positions) >= MAX_POSITIONS:
+            print(f"  ⚪ Max positions reached ({MAX_POSITIONS}), skipping new entries")
+            break
         if any(p['symbol'] == symbol for p in positions):
             print(f"  ⚪ {symbol}: Position open")
             continue
@@ -455,20 +563,22 @@ def run_cycle():
             
             size = get_position_size(balance, signal['entry'])
             side = 'BUY' if signal['direction'] == 'LONG' else 'SELL'
-            result = place_order(symbol, side, size)
+            
+            # Use Neko method: Market order + Algo SL/TP
+            result = place_order_with_algo_sl_tp(symbol, side, size, signal['sl'], signal['tp'])
             
             if result.get('orderId'):
                 position_opened[symbol] = int(time.time())
                 msg = f"📢 *New {signal['direction']} Signal*\n\n"
                 msg += f"🪙 {symbol}\n"
                 msg += f"💰 Entry: ${signal['entry']:.4f}\n"
-                msg += f"🛡 SL: ${signal['sl']:.4f}\n"
-                msg += f"📈 TP: ${signal['tp']:.4f}\n"
+                msg += f"🛡 SL: ${signal['sl']:.4f} (algo)\n"
+                msg += f"📈 TP: ${signal['tp']:.4f} (algo)\n"
                 msg += f"⚖️ R:R: {signal['rr']}:1\n"
                 msg += f"📊 RSI: {signal['rsi']} | VCS: {signal['vcs']}\n"
                 msg += f"💵 Qty: {size:.4f}"
                 send_telegram(msg)
-                print(f"  ✅ Order placed: {side} {size:.4f} {symbol}")
+                print(f"  ✅ Full order placed: {side} {size:.4f} {symbol} with SL/TP algo")
             else:
                 print(f"  ❌ Order failed: {result}")
         else:
