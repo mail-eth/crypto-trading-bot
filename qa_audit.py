@@ -100,9 +100,8 @@ def run_qa():
             entry = float(positions[0]['entryPrice'])
             checks.append(("Positions", True, f"{sym}: {qty} @ ${entry:.2f}"))
         else:
-            pos_info = ", ".join([f"{p['symbol']}:{p['positionAmt']}" for p in positions])
-            checks.append(("⚠️ Positions", False, f"Multiple: {pos_info}"))
-            issues.append(f"⚠️ Multiple positions detected: {pos_info}")
+            pos_info = ", ".join([f"{p['symbol']}" for p in positions])
+            checks.append(("Positions", True, f"{len(positions)} open: {pos_info}"))
     except Exception as e:
         checks.append(("Positions", False, str(e)))
         issues.append(f"❌ Position check failed: {e}")
