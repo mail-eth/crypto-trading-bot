@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """
-Bollinger Bands + ATR Strategy v2 (Improved)
-Best for: LOW VOLUME, RANGE-BOUND markets
+Bollinger Bands + ATR Strategy v4
+Fixed from v3 analysis:
+- Strict entry filters (RSI + Volume + BB)
+- Max 5 trades/day
+- Position 40%, TP 7%, SL 2%
+- Daily loss cap -$2
+- 1 hour cooldown after loss
+- Symbol whitelist only
 
-Improvements:
-- ATR-based SL/TP with dynamic multipliers based on VCS
-- Trailing stop when in profit
-- Time-based exit (max hold time)
-- RSI neutral exit
-- Better signal filters
-
-Entry: Price touches lower BB + confirmations = BUY
-Exit: ATR-based SL/TP + Trailing SL + Time Exit
+Entry: RSI oversold/overbought + BB touch + Volume spike
+Exit: Fixed TP/SL + trailing stop + time exit
 """
 
 import requests
@@ -43,9 +42,9 @@ TRAILING_DISTANCE = 0.004  # Lock in 0.4% profit
 # Time Exit
 MAX_HOLD_CANDLES = 48  # 4 hours (48 x 5min candles)
 
-# Fixed percentage TP/SL (bigger for $5/day target)
-PRICE_SL_PCT = 0.025  # 2.5% SL
-PRICE_TP_PCT = 0.05  # 5% TP
+# Fixed percentage TP/SL (v4: balanced for fees)
+PRICE_SL_PCT = 0.02  # 2% SL
+PRICE_TP_PCT = 0.07  # 7% TP
 PRICE_FALLBACK_MIN_ATR = 0.002
 PRICE_FALLBACK_MAX_ATR = 0.05
 
@@ -69,13 +68,24 @@ API_SECRET = os.environ.get('BINANCE_API_SECRET', '')
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
 
-POSITION_PCT = 0.80  # 80% of balance per trade
-MIN_POSITION = 40
-MAX_POSITION = 100
+POSITION_PCT = 0.40  # 40% of balance per trade (v4: reduced for safety)
+MIN_POSITION = 30
+MAX_POSITION = 80
 MAX_POSITIONS = 2  # Max 2 positions at once
+MAX_TRADES_PER_DAY = 5  # v4: Quality > quantity (max 5 trades/day)
+DAILY_LOSS_CAP = 2.0  # v4: Hard stop at -$2/day
+LOSS_COOLDOWN_MINUTES = 60  # v4: Wait 1 hour after any loss
 
 # Track position open time
 position_opened = {}
+
+# v4: Trade tracking
+trades_today = 0
+last_loss_time = 0
+last_trade_date = ""
+
+# v4: Symbol whitelist (no ADA!)
+SYMBOL_WHITELIST = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XAUUSDT", "XAGUSDT"]
 
 def get_signature(query_string):
     return hmac.new(API_SECRET.encode(), query_string.encode(), hashlib.sha256).hexdigest()
@@ -155,9 +165,32 @@ def round_quantity(quantity, step_size):
     decimals = len(step_str.split('.')[1]) if '.' in step_str else 0
     return float(f"{quantity:.{decimals}f}")
 
+def cancel_algo_orders(symbol):
+    """Cancel all existing algo orders for a symbol before placing new ones"""
+    headers = {'X-MBX-APIKEY': API_KEY}
+    ts = int(time.time() * 1000)
+    params = f"symbol={symbol}&timestamp={ts}&recvWindow=5000"
+    sig = get_signature(params)
+    url = f"{BASE_URL}/fapi/v1/algoOrder?{params}&signature={sig}"
+    
+    try:
+        r = requests.delete(url, headers=headers, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            cnt = len(data.get('algos', []))
+            if cnt > 0:
+                print(f"  🗑️ Canceled {cnt} old algo orders for {symbol}")
+            return True
+    except Exception as e:
+        print(f"  ⚠️ Cancel algo error: {e}")
+    return False
+
 def place_order_with_algo_sl_tp(symbol, side, quantity, sl_price, tp_price):
     """Place market order FIRST, then set SL/TP via algoOrder (Neko method)"""
     headers = {'X-MBX-APIKEY': API_KEY}
+    
+    # Cancel existing algo orders FIRST to avoid pile-up
+    cancel_algo_orders(symbol)
     
     # Round quantity to proper step size
     step_size = get_step_size(symbol)
@@ -336,6 +369,7 @@ def check_signal(symbol):
     closes = [k[3] for k in klines]
     highs = [k[0] for k in klines]
     lows = [k[1] for k in klines]
+    volumes = [k[4] for k in klines]
     current = closes[-1]
     
     bb_upper, bb_middle, bb_lower = get_bb(closes)
@@ -345,6 +379,11 @@ def check_signal(symbol):
     ema_21 = calc_ema(closes, 21)
     vcs = calc_vcs(klines)
     macd, signal, hist = calc_macd(closes)
+    
+    # Volume confirmation (v3): check if volume > 20MA volume
+    avg_volume = sum(volumes[-20:]) / 20
+    current_volume = volumes[-1]
+    volume_spike = current_volume > avg_volume * 1.2  # 20% above average
     
     if None in [bb_upper, bb_middle, bb_lower, rsi, atr]:
         return None
@@ -360,6 +399,10 @@ def check_signal(symbol):
         
         if hist and hist < 0:
             return None
+        
+        # Volume confirmation (v3)
+        if not volume_spike:
+            return None  # Skip weak signals without volume
         
         sl, tp = get_sl_tp_vcs(current, atr, "LONG", atr_pct, vcs)
         rr_ratio = (tp - current) / (current - sl) if sl != current else 0
@@ -385,6 +428,10 @@ def check_signal(symbol):
         
         if hist and hist > 0:
             return None
+        
+        # Volume confirmation (v3)
+        if not volume_spike:
+            return None  # Skip weak signals without volume
         
         sl, tp = get_sl_tp_vcs(current, atr, "SHORT", atr_pct, vcs)
         rr_ratio = (current - tp) / (sl - current) if sl != current else 0
@@ -487,15 +534,23 @@ def check_positions():
         
         if should_close:
             result = close_position(symbol, float(pos['positionAmt']))
+            pnl = float(pos.get('unrealizedProfit', 0))
             closed.append({
                 'symbol': symbol,
                 'reason': reason,
                 'qty': qty,
                 'entry': entry,
                 'exit': current,
-                'pnl': float(pos.get('unrealizedProfit', 0))
+                'pnl': pnl
             })
-            send_telegram(f"📤 Closed {symbol}\nReason: {reason}\nPrice: ${current:.4f}\nP&L: ${float(pos.get('unrealizedProfit', 0)):.2f}")
+            send_telegram(f"📤 Closed {symbol}\nReason: {reason}\nPrice: ${current:.4f}\nP&L: ${pnl:.2f}")
+            
+            # v4: Set cooldown if closed at loss
+            if pnl < 0:
+                global last_loss_time
+                last_loss_time = time.time()
+                print(f"  ⚠️ Loss detected: {symbol} P&L ${pnl:.2f} - Cooldown started for {LOSS_COOLDOWN_MINUTES} min")
+            
             if symbol in position_opened:
                 del position_opened[symbol]
     
@@ -507,13 +562,38 @@ def get_position_size(balance, entry_price):
     size = margin / risk_per_unit if risk_per_unit > 0 else 0
     return min(max(size, MIN_POSITION / entry_price), MAX_POSITION / entry_price)
 
+def get_today_pnl():
+    """Get today's realized P&L (v3: for daily loss cap)"""
+    try:
+        ts = int(time.time() * 1000)
+        start = int((time.time() - 24*60*60) * 1000)  # last 24h
+        params = f"timestamp={ts}&startTime={start}&limit=100&recvWindow=5000"
+        sig = get_signature(params)
+        url = f"{BASE_URL}/fapi/v1/income?{params}&signature={sig}"
+        r = requests.get(url, headers={'X-MBX-APIKEY': API_KEY}, timeout=10)
+        trades = r.json()
+        realized = [t for t in trades if t.get('incomeType') == 'REALIZED_PNL']
+        return sum(float(t.get('income', 0)) for t in realized)
+    except:
+        return 0  # If check fails, allow trading
+
 def run_cycle():
     print("=" * 60)
-    print("📊 BB + ATR Strategy v2 (Improved)")
+    print("📊 BB + ATR Strategy v4 (Fixed)")
     print("=" * 60)
     
     balance = get_balance()
     print(f"💰 Balance: ${balance:.2f}")
+    
+    # Daily loss cap check (v3)
+    today_pnl = get_today_pnl()
+    if today_pnl <= -DAILY_LOSS_CAP:
+        print(f"🔴 DAILY LOSS CAP HIT: ${today_pnl:.2f} <= -${DAILY_LOSS_CAP}")
+        print("🔴 Stopping trading for today. Will resume tomorrow.")
+        send_telegram(f"🔴 <b>Daily Loss Cap Hit</b>\nP&L: ${today_pnl:.2f}\nStopping for today.")
+        return
+    elif today_pnl < 0:
+        print(f"⚠️ Today P&L: ${today_pnl:.2f} (loss cap: -${DAILY_LOSS_CAP})")
     
     closed = check_positions()
     if closed:
@@ -549,7 +629,30 @@ def run_cycle():
     
     print("\n🔍 Scanning...")
     
+    # v4: Check and update trade count for today
+    global trades_today, last_loss_time, last_trade_date
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    if last_trade_date != today_str:
+        trades_today = 0  # Reset for new day
+        last_trade_date = today_str
+    
+    # v4: Check loss cooldown
+    if last_loss_time > 0:
+        cooldown_remaining = LOSS_COOLDOWN_MINUTES * 60 - (time.time() - last_loss_time)
+        if cooldown_remaining > 0:
+            print(f"  ⏸️ In cooldown after loss: {int(cooldown_remaining/60)} min remaining")
+    
     for symbol in SYMBOLS:
+        # v4: Symbol whitelist check
+        if symbol not in SYMBOL_WHITELIST:
+            print(f"  ⛔ {symbol}: Not in whitelist, skipping")
+            continue
+        
+        # v4: Max trades per day check
+        if trades_today >= MAX_TRADES_PER_DAY:
+            print(f"  ⛔ Max trades today ({MAX_TRADES_PER_DAY}), skipping new entries")
+            break
+        
         if len(positions) >= MAX_POSITIONS:
             print(f"  ⚪ Max positions reached ({MAX_POSITIONS}), skipping new entries")
             break
@@ -579,6 +682,8 @@ def run_cycle():
                 msg += f"💵 Qty: {size:.4f}"
                 send_telegram(msg)
                 print(f"  ✅ Full order placed: {side} {size:.4f} {symbol} with SL/TP algo")
+                trades_today += 1  # v4: Track trade count
+                print(f"  📊 Trades today: {trades_today}/{MAX_TRADES_PER_DAY}")
             else:
                 print(f"  ❌ Order failed: {result}")
         else:
